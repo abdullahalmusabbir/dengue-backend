@@ -127,11 +127,9 @@ STORAGES = {
 
 REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.AllowAny',   
+        'rest_framework.permissions.AllowAny',
     ],
-    'DEFAULT_AUTHENTICATION_CLASSES': [],        
+    'DEFAULT_AUTHENTICATION_CLASSES': [],
 }
 
-CORS_ALLOWED_ORIGINS = [
-    "https://dengue-two-delta.vercel.app/",
-]
+CORS_ALLOWED_ORIGINS = [origin.strip() for origin in get_env('CORS_ALLOWED_ORIGINS').split(',') if origin.strip()]
