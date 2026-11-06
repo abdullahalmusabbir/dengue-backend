@@ -1,11 +1,11 @@
 """
 deocker_services.py
 --------------------
-D-CHSS Dengue Detectionmodels এর prediction service।
+D-CHSS Dengue Detection modèles এর prediction service।
 
 এই সংস্করণটি 13.ipynb থেকে export করা-trained sklearn pipeline artifact
 (dengue_dchss_model.pkl) ব্যবহার করে। প্রি-প্রসেসিং (D-ChSS feature builder,
-imputation, scaling ও মডেল) সবই artifact এর ভেতরে ব aceptó থাকে,
+imputation, scaling ও মডেল) সবই artifact এর ভেতরে ব accepted থাকে,
 যা make_prediction() (dchss_model.py) এর মাধ্যমে predict করে।
 
 Django শুধু artifact লোড করে, একটি CBC record পাঠায় এবং ফলাফল ফেরত পায়।
@@ -21,12 +21,14 @@ import threading
 from django.conf import settings
 
 # ---------------------------------------------------------------------------
-# Repo root কে import path এ যোগ করা, যাতে dchss_model.py (repo root এ থাকা)
-# যে কোনো working directory থেকে import করা যায়।
+# Repo root ও ml_model ডিরেক্টরি কে import path এ যোগ করা, যাতে
+# dchss_model.py (dengues/ml_model এ থাকা) যে কোনো working directory থেকে
+# import করা যায়।
 # ---------------------------------------------------------------------------
-_PROJECT_ROOT = settings.BASE_DIR.parent.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+_PROJECT_ROOT = settings.BASE_DIR.parent  # /app (repo root)
+_ML_MODEL_DIR = os.path.join(str(_PROJECT_ROOT), "dengues", "ml_model")
+if str(_ML_MODEL_DIR) not in sys.path:
+    sys.path.insert(0, str(_ML_MODEL_DIR))
 
 from dchss_model import make_prediction  # noqa: E402
 
@@ -39,7 +41,7 @@ class ModelNotLoadedError(Exception):
 # ---------------------------------------------------------------------------
 # ⭐ Model artifact path - এখানেই .pkl ফাইলটা রাখতে হবে
 # ---------------------------------------------------------------------------
-MODEL_PATH = os.path.join(str(_PROJECT_ROOT), "dengue_dchss_model.pkl")
+MODEL_PATH = os.path.join(str(_ML_MODEL_DIR), "dengue_dchss_model.pkl")
 
 EPS = 1e-6
 
