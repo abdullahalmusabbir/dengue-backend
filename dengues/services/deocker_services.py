@@ -25,7 +25,7 @@ from django.conf import settings
 # dchss_model.py (dengues/ml_model এ থাকা) যে কোনো working directory থেকে
 # import করা যায়।
 # ---------------------------------------------------------------------------
-_PROJECT_ROOT = settings.BASE_DIR.parent  # /app (repo root)
+_PROJECT_ROOT = settings.BASE_DIR  # /app (repo root)
 _ML_MODEL_DIR = os.path.join(str(_PROJECT_ROOT), "dengues", "ml_model")
 if str(_ML_MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(_ML_MODEL_DIR))
