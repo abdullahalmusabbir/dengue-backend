@@ -149,7 +149,7 @@ def compute_dchss_score(raw_input, artifact):
 def assign_risk_group(dchss_score, risk_thresholds=None):
     """
     D-ChSS score কে Low / Moderate / High এ ভাগ করা।
-    artifact এ risk_thresholds না থাকলে default threshold ব্যবহার করা হয়।
+    artifact 에 risk_thresholds না থাকলে default threshold ব্যবহার করা হয়।
     """
     if risk_thresholds is None:
         risk_thresholds = (0.25, 0.50)
