@@ -1,7 +1,7 @@
 """
 deocker_services.py
 --------------------
-D-CHSS Dengue Detection modèles এর prediction service।
+D-CHSS Dengue Detection মডেলের prediction service।
 
 এই সংস্করণটি 13.ipynb থেকে export করা-trained sklearn pipeline artifact
 (dengue_dchss_model.pkl) ব্যবহার করে। প্রি-প্রসেসিং (D-ChSS feature builder,
@@ -12,6 +12,15 @@ Django শুধু artifact লোড করে, একটি CBC record পা
 dchss_score, risk_group এবং top_feature_explanations extraordinaire field গুলো
 artifact মেটাডাটা থেকে এখানে compute করা হয়, যাতে Django view / model schema
 এবং frontend API response কনট్రాక్టর একই থাকে (কোনো ব্রেকিং চেঞ্জ নেই)।
+
+সূচনা:
+1. compute_deviation() নোটবুকের transform()-এর সাথে একই লজিক maintains করে।
+   রেফারেন্স রেঞ্জের ভেতরে থাকলে deviation ০; বাইরে থাকলে বাউন্ডারি থেকে
+   সাইনড ডেভিয়েশন, এবং ±max_dev এ ক্যাপ করা হয়।
+2. rdw_platelet_ratio ফিচার এখন notebook এ থাকা ভাব অনুযায়ী
+   (rdw_cv / platelet × 1000) হিসাব করে predict_dengue()-এ যোগ করা হয়।
+3. risk_group হলো D-ChSS স্কোর (রক্তের CBC হিসাবের অস্বাভাবিকতার মাত্রা)
+   থেকে বের করা লেবেল, এটি ডেঙ্গু probability ভিত্তিক ঝুঁকির লেবেল নয়।
 """
 
 import os
@@ -87,8 +96,13 @@ def _get_interval(artifact, feature, gender):
 
 def _compute_deviation(value, low, high, max_dev):
     """
-    Reference range এর বাউন্ডারি থেকে signed deviation বের করা এবং max_dev 에 cap করা।
+    Reference range এর বাউন্ডারি থেকে signed deviation বের করা এবং max_dev এ cap করা।
     dchss_model.py এর transform()-এর সাথে একই সংজ্ঞা।
+    
+    ম Tobago:
+    - value < low:  (value - low) / low
+    - value > high: (value - high) / high
+    - otherwise:    0.0
     """
     if value is None or low is None or high is None:
         return 0.0
@@ -149,7 +163,11 @@ def compute_dchss_score(raw_input, artifact):
 def assign_risk_group(dchss_score, risk_thresholds=None):
     """
     D-ChSS score কে Low / Moderate / High এ ভাগ করা।
-    artifact 에 risk_thresholds না থাকলে default threshold ব্যবহার করা হয়।
+    
+    দ্রষ্টব্য: এই লেবেলটি ডেঙ্গু probability ভিত্তিক ঝুঁকির লেবেল নয়। 
+    এটি শুধু D-ChSS স্কোর থেকে বের করা হয়, যা রক্তের CBC হিসাবের 
+    অস্বাভাবিকতার মাত্রা (deviation) প্রকাশ করে। ডেঙ্গু ঝুঁকি বোঝার জন্য
+    probability_percent (predict_dengue()-এর রিটার্ন করা মান) ব্যবহার করুন।
     """
     if risk_thresholds is None:
         risk_thresholds = (0.25, 0.50)
@@ -167,6 +185,9 @@ def build_top_feature_explanations(raw_input, artifact, top_n=8):
     প্রতিটি CBC feature এর deviation magnitude অনুযায়ী top_N ফিচার কে
     explanation হিসেবে রিটার্ন করা (SHAP এর বদলে lightweight approximation)।
     effect মানে 'dengue risk বাড়াচ্ছে' বা 'dengue risk কমাচ্ছে'।
+    
+    দ্রষ্টব্য: deviation মagni tude শুধু রেফারেন্স রেঞ্জের বাইরে থাকার পরিমাপ,
+    ডেঙ্গু probability এ সরাসরি অবদান নয়।
     """
     reference_ranges = artifact["reference_ranges"]
     cbc_features = artifact["cbc_features"]
@@ -221,6 +242,18 @@ def predict_dengue(raw_input: dict) -> dict:
     """
     raw_input = dict(raw_input)
     raw_input["gender"] = str(raw_input.get("gender", "other")).lower()
+
+    # ⭐ rdw_platelet_ratio ফিচার যোগ করা (13.ipynb নোটবুকের সাথে মেলানোর জন্য)
+    # Notebook এ: rdw_platelet_ratio = RDW-CV ÷ platelet × 1000
+    try:
+        rdw_cv_val = float(raw_input.get("rdw_cv", 0) or 0)
+        platelet_val = float(raw_input.get("platelet", 0) or 0)
+        if platelet_val > 0:
+            raw_input["rdw_platelet_ratio"] = (rdw_cv_val / platelet_val) * 1000.0
+        else:
+            raw_input["rdw_platelet_ratio"] = 0.0
+    except (TypeError, ValueError):
+        raw_input["rdw_platelet_ratio"] = 0.0
 
     artifact = load_artifact()
 
