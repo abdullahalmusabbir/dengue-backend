@@ -1,21 +1,34 @@
 """
 deocker_services.py
 --------------------
-Pure-Python (ZERO external ML library) prediction service for the
-D-CHSS Dengue Detection model.
+D-CHSS Dengue Detectionmodels এর prediction service।
 
-Model artifact location:
-    backend/dengue/dengues/ml_model/dchss_model_pure_python.pkl
+এই সংস্করণটি 13.ipynb থেকে export করা-trained sklearn pipeline artifact
+(dengue_dchss_model.pkl) ব্যবহার করে। প্রি-প্রসেসিং (D-ChSS feature builder,
+imputation, scaling ও মডেল) সবই artifact এর ভেতরে ব aceptó থাকে,
+যা make_prediction() (dchss_model.py) এর মাধ্যমে predict করে।
 
-Uses only: os, math, pickle, threading (builtin) + Django settings.
-NO pandas / numpy / scikit-learn / scipy / xgboost / shap anywhere.
+Django শুধু artifact লোড করে, একটি CBC record পাঠায় এবং ফলাফল ফেরত পায়।
+dchss_score, risk_group এবং top_feature_explanations extraordinaire field গুলো
+artifact মেটাডাটা থেকে এখানে compute করা হয়, যাতে Django view / model schema
+এবং frontend API response কনট్రాక్టর একই থাকে (কোনো ব্রেকিং চেঞ্জ নেই)।
 """
 
 import os
-import math
+import sys
 import pickle
 import threading
 from django.conf import settings
+
+# ---------------------------------------------------------------------------
+# Repo root কে import path এ যোগ করা, যাতে dchss_model.py (repo root এ থাকা)
+# যে কোনো working directory থেকে import করা যায়।
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = settings.BASE_DIR.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from dchss_model import make_prediction  # noqa: E402
 
 
 class ModelNotLoadedError(Exception):
@@ -23,12 +36,10 @@ class ModelNotLoadedError(Exception):
     pass
 
 
-# -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # ⭐ Model artifact path - এখানেই .pkl ফাইলটা রাখতে হবে
-# -----------------------------------------------------------------
-MODEL_PATH = os.path.join(
-    settings.BASE_DIR, 'dengues', 'ml_model', 'dchss_model_pure_python.pkl'
-)
+# ---------------------------------------------------------------------------
+MODEL_PATH = os.path.join(str(_PROJECT_ROOT), "dengue_dchss_model.pkl")
 
 EPS = 1e-6
 
@@ -48,226 +59,152 @@ def load_artifact():
                 if not os.path.exists(MODEL_PATH):
                     raise ModelNotLoadedError(
                         f"Model artifact পাওয়া যায়নি: {MODEL_PATH}. "
-                        f"notebook থেকে generate করা 'dchss_model_pure_python.pkl' "
-                        f"file টা ঐ path এ কপি করতে হবে।"
+                        f"13.ipynb থেকে generate করা 'dengue_dchss_model.pkl' "
+                        f"file টা এই path এ কপি করতে হবে।"
                     )
-                with open(MODEL_PATH, 'rb') as f:
+                with open(MODEL_PATH, "rb") as f:
                     _artifact = pickle.load(f)
     return _artifact
 
 
-# -----------------------------------------------------------------
-# Pure-python math helpers
-# -----------------------------------------------------------------
-def sigmoid(z):
-    """Numerically stable sigmoid - overflow avoid করার জন্য branch করা হয়েছে"""
-    if z >= 0:
-        ez = math.exp(-z)
-        return 1.0 / (1.0 + ez)
-    else:
-        ez = math.exp(z)
-        return ez / (1.0 + ez)
-
-
-def get_range(param, gender, reference_ranges):
+# ---------------------------------------------------------------------------
+# D-ChSS score ও risk group helpers (artifact মেটাডাটা থেকে compute)
+# dchss_model.DChSSFeatureBuilder এর "dchss_only" মোডের লজciens mirror করে।
+# ---------------------------------------------------------------------------
+def _get_interval(artifact, feature, gender):
     """Gender-specific clinical reference range বের করা (না থাকলে default)"""
-    rng = reference_ranges.get(param)
-    if rng is None:
-        return None
-    if isinstance(rng, dict):
-        if gender == 'male':
-            return rng.get('male', rng.get('default'))
-        else:
-            return rng.get('female', rng.get('default'))
-    return rng  # tuple (low, high)
+    interval = artifact["reference_ranges"][feature]
+    if isinstance(interval, dict):
+        if gender == 1:
+            return interval["male"]
+        if gender == 0:
+            return interval["female"]
+        return interval["default"]
+    return interval  # tuple (low, high)
 
 
-def _mean_std(stats):
+def _compute_deviation(value, low, high, max_dev):
     """
-    Scaler-stats নਿਰ্বল unterschiedlichen formato এ থাকতে পারে:
-      - dict: {'mean': ..., 'std': ...}
-      - tuple: (mean, std)
-    এই ফাংশনটি দুikt scenarioই handle করে এবং (mean, std) রিটার্ন করে।
-    """
-    if isinstance(stats, dict):
-        return stats['mean'], stats['std']
-    # tuple (mean, std)
-    return stats[0], stats[1]
-
-
-def compute_deviation(value, low, high, max_dev):
-    """
-    Normal range এর মধ্যমান (mid) থেকে signed deviation বের করা,
-    half-range দিয়ে normalize করা এবং max_dev এ cap করা।
+    Reference range এর বাউন্ডারি থেকে signed deviation বের করা এবং max_dev 에 cap করা।
+    dchss_model.py এর transform()-এর সাথে একই সংজ্ঞা।
     """
     if value is None or low is None or high is None:
         return 0.0
-    mid = (low + high) / 2.0
-    half_range = (high - low) / 2.0
-    if half_range == 0:
-        return 0.0
-    dev = (value - mid) / half_range
-    if dev > max_dev:
-        dev = max_dev
-    elif dev < -max_dev:
-        dev = -max_dev
-    return dev
-
-
-def compute_state(value, low, high):
-    """Explanation এর জন্য human-readable state: low / normal / high"""
-    if value is None:
-        return 'unknown'
     if value < low:
-        return 'low'
-    if value > high:
-        return 'high'
-    return 'normal'
+        dev = (value - low) / low
+    elif value > high:
+        dev = (value - high) / high
+    else:
+        dev = 0.0
+    return float(max(-max_dev, min(max_dev, dev)))
 
 
-def calibrate_prob(raw_prob, cal_x, cal_y):
+def compute_dchss_score(raw_input, artifact):
     """
-    PAVA (Isotonic Regression) থেকে পাওয়া knot points (cal_x, cal_y) দিয়ে
-    linear interpolation করে raw probability কে calibrated probability তে রূপান্তর করা।
+    D-ChSS score বের করা artifact এর reference_ranges, dchss_weights এবং
+    ts/ls/hs features ব্যবহার করে। (TS, LS, HS উপাদানও রিটার্ন করে)
     """
-    if raw_prob <= cal_x[0]:
-        return cal_y[0]
-    if raw_prob >= cal_x[-1]:
-        return cal_y[-1]
-    for i in range(1, len(cal_x)):
-        if raw_prob <= cal_x[i]:
-            x0, x1 = cal_x[i - 1], cal_x[i]
-            y0, y1 = cal_y[i - 1], cal_y[i]
-            if x1 == x0:
-                return y1
-            t = (raw_prob - x0) / (x1 - x0)
-            return y0 + t * (y1 - y0)
-    return cal_y[-1]
+    reference_ranges = artifact["reference_ranges"]
+    weights = artifact["dchss_weights"]  # {'TS':.., 'LS':.., 'HS':..}
+    cbc_features = artifact["cbc_features"]
+    ts_features = artifact["ts_features"]
+    ls_features = artifact["ls_features"]
+    hs_features = artifact["hs_features"]
+
+    gender = str(raw_input.get("gender", "other")).strip().lower()
+    if gender in {"male", "m", "man", "1"}:
+        gender_enc = 1
+    elif gender in {"female", "f", "woman", "0"}:
+        gender_enc = 0
+    else:
+        gender_enc = -1
+
+    max_dev = 1.0
+    signed = {}
+    for feature in cbc_features:
+        value = raw_input.get(feature)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = 0.0
+        low, high = _get_interval(artifact, feature, gender_enc)
+        signed[feature] = _compute_deviation(value, low, high, max_dev)
+
+    absolute = {f: abs(v) for f, v in signed.items()}
+
+    def mean_dev(feats):
+        vals = [absolute[f] for f in feats if f in absolute]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    ts = mean_dev(ts_features)
+    ls = mean_dev(ls_features)
+    hs = mean_dev(hs_features)
+
+    dchss = weights["TS"] * ts + weights["LS"] * ls + weights["HS"] * hs
+    return round(dchss, 4), {"TS": ts, "LS": ls, "HS": hs, "signed": signed}
 
 
-# -----------------------------------------------------------------
-# Feature engineering pipeline (notebook cells 8,9,10,12,13 এর mirror)
-# -----------------------------------------------------------------
-def build_feature_row(raw_input, artifact):
-    reference_ranges = artifact['reference_ranges']
-    max_dev = artifact['max_dev']
-    cbc_features = artifact['cbc_features']
-    thrombo_params = artifact['thrombo_params']
-    leuko_params = artifact['leuko_params']
-    hemo_params = artifact['hemo_params']
-    comp_scaler = artifact['component_scaler']
-    dchss_weights = artifact['dchss_weights']  # (w_ts, w_ls, w_hs)
-
-    gender = str(raw_input.get('gender', 'other')).lower()
-
-    row = {}
-    for feat in cbc_features:
-        row[feat] = float(raw_input[feat])
-
-    # ---- deviation features ----
-    dev_values = {}
-    for feat in cbc_features:
-        rng = get_range(feat, gender, reference_ranges)
-        if rng is None:
-            dev_values[feat] = 0.0
-            continue
-        low, high = rng
-        dev_values[feat] = compute_deviation(row[feat], low, high, max_dev)
-        row[f'{feat}_dev'] = dev_values[feat]
-
-    # ---- ratio features ----
-    row['nlr'] = row['neutrophils'] / (row['lymphocytes'] + EPS)
-    row['plr'] = row['platelet'] / (row['lymphocytes'] + EPS)
-    row['lmr'] = row['lymphocytes'] / (row['monocytes'] + EPS)
-    row['pdw_mpv_ratio'] = row['pdw'] / (row['mpv'] + EPS)
-    row['rdw_platelet_ratio'] = row['rdw_cv'] / (row['platelet'] + EPS)
-
-    # ---- D-CHSS component raw scores ----
-    ts_raw = sum(abs(dev_values[p]) for p in thrombo_params) / len(thrombo_params)
-    ls_raw = sum(abs(dev_values[p]) for p in leuko_params) / len(leuko_params)
-    hs_raw = sum(abs(dev_values[p]) for p in hemo_params) / len(hemo_params)
-
-    def std_comp(name, value):
-        stats = comp_scaler[name]
-        mean, std = _mean_std(stats)
-        std = std if std != 0 else 1.0
-        return (value - mean) / std
-
-    ts_std = std_comp('TS_raw', ts_raw)
-    ls_std = std_comp('LS_raw', ls_raw)
-    hs_std = std_comp('HS_raw', hs_raw)
-
-    w_ts, w_ls, w_hs = dchss_weights
-    dchss = w_ts * ts_std + w_ls * ls_std + w_hs * hs_std
-
-    row['TS_std'] = ts_std
-    row['LS_std'] = ls_std
-    row['HS_std'] = hs_std
-    row['DCHSS'] = dchss
-
-    return row, dev_values
-
-
-def standardize_row(row, artifact):
-    """Full feature vector কে train-time fitted mean/std দিয়ে standardize করা"""
-    full_features = artifact['full_features']
-    full_scaler = artifact['full_scaler']
-    z = []
-    for feat in full_features:
-        stats = full_scaler[feat]
-        mean, std = _mean_std(stats)
-        std = std if std != 0 else 1.0
-        val = row.get(feat, 0.0)
-        z.append((val - mean) / std)
-    return z
-
-
-def compute_logit(z_vector, artifact):
-    weights = artifact['model_weights']
-    bias = artifact['model_bias']
-    logit = bias
-    for w, zv in zip(weights, z_vector):
-        logit += w * zv
-    return logit
-
-
-def explain_contributions(z_vector, artifact, top_n=8):
+def assign_risk_group(dchss_score, risk_thresholds=None):
     """
-    SHAP এর বদলে exact linear decomposition: contribution[i] = weight[i] * z[i]
-    Logistic regression হওয়ায় এটা পুরোপুরি accurate/exact explanation (approximation না)।
+    D-ChSS score কে Low / Moderate / High এ ভাগ করা।
+    artifact এ risk_thresholds না থাকলে default threshold ব্যবহার করা হয়।
     """
-    weights = artifact['model_weights']
-    full_features = artifact['full_features']
+    if risk_thresholds is None:
+        risk_thresholds = (0.25, 0.50)
+    low_thresh, high_thresh = risk_thresholds
+    if dchss_score < low_thresh:
+        return "Low"
+    elif dchss_score <= high_thresh:
+        return "Moderate"
+    else:
+        return "High"
+
+
+def build_top_feature_explanations(raw_input, artifact, top_n=8):
+    """
+    প্রতিটি CBC feature এর deviation magnitude অনুযায়ী top_N ফিচার কে
+    explanation হিসেবে রিটার্ন করা (SHAP এর বদলে lightweight approximation)।
+    effect মানে 'dengue risk বাড়াচ্ছে' বা 'dengue risk কমাচ্ছে'।
+    """
+    reference_ranges = artifact["reference_ranges"]
+    cbc_features = artifact["cbc_features"]
+
+    gender = str(raw_input.get("gender", "other")).strip().lower()
+    if gender in {"male", "m", "man", "1"}:
+        gender_enc = 1
+    elif gender in {"female", "f", "woman", "0"}:
+        gender_enc = 0
+    else:
+        gender_enc = -1
+
     contributions = []
-    for feat, w, zv in zip(full_features, weights, z_vector):
-        contributions.append((feat, w * zv))
+    for feature in cbc_features:
+        value = raw_input.get(feature)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        low, high = _get_interval(artifact, feature, gender_enc)
+        if low is None or high is None:
+            continue
+        dev = _compute_deviation(value, low, high, 1.0)
+        if abs(dev) < EPS:
+            continue
+        effect = "dengue risk বাড়াচ্ছে" if dev > 0 else "dengue risk কমাচ্ছে"
+        contributions.append((feature, round(dev, 4), effect))
+
     contributions.sort(key=lambda x: abs(x[1]), reverse=True)
     top = contributions[:top_n]
 
     explanations = []
-    for feat, contrib in top:
-        effect = 'dengue risk বাড়াচ্ছে' if contrib > 0 else 'dengue risk কমাচ্ছে'
-        explanations.append({
-            'feature': feat,
-            'contribution': round(contrib, 4),
-            'effect': effect,
-        })
+    for feat, contrib, effect in top:
+        explanations.append({"feature": feat, "contribution": contrib, "effect": effect})
     return explanations
 
 
-def assign_risk_group(dchss_score, risk_thresholds):
-    low_thresh, high_thresh = risk_thresholds
-    if dchss_score < low_thresh:
-        return 'Low'
-    elif dchss_score <= high_thresh:
-        return 'Moderate'
-    else:
-        return 'High'
-
-
-# -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # ⭐ Public API - Django view থেকে এই ফাংশনটাই call হবে
-# -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def predict_dengue(raw_input: dict) -> dict:
     """
     raw_input: {
@@ -276,36 +213,40 @@ def predict_dengue(raw_input: dict) -> dict:
         'eosinophils':.., 'rbc':.., 'hct':.., 'mcv':.., 'mch':.., 'mchc':..,
         'rdw_cv':.., 'platelet':.., 'mpv':.., 'pdw':.., 'pct':.., 'wbc':..
     }
+
+    রিটার্ন ডিকশনারি keys গুলো views.py ও frontend (DenguePredictionResult)-এর
+    সাথে একই রাখা হয়েছে, তাই কোনো ব্রেকিং চেঞ্জ নেই।
     """
-    # Frontend কখনো কখনো 'Male'/'Female' (capital) পাঠায়; serializer Lowercase চায়,
-    # তাই নিরাপদের জন্য এখানে নরমালাইজ করছি।
     raw_input = dict(raw_input)
-    raw_input['gender'] = str(raw_input.get('gender', 'other')).lower()
+    raw_input["gender"] = str(raw_input.get("gender", "other")).lower()
 
     artifact = load_artifact()
 
-    row, _dev_values = build_feature_row(raw_input, artifact)
-    z_vector = standardize_row(row, artifact)
+    # Core probability / prediction trained sklearn pipeline- এর মাধ্যমে
+    result = make_prediction(artifact, raw_input)
 
-    raw_logit = compute_logit(z_vector, artifact)
-    raw_prob = sigmoid(raw_logit)
+    probability = float(result["probability"])
+    threshold = float(result["threshold"])
+    prediction_int = int(result["prediction"])
+    prediction_label = "Positive" if prediction_int == 1 else "Negative"
 
-    calibrated_prob = calibrate_prob(raw_prob, artifact['cal_x'], artifact['cal_y'])
-    probability_percent = round(calibrated_prob * 100, 2)
+    probability_percent = round(probability * 100, 2)
+    threshold_used_percent = round(threshold * 100, 2)
 
-    threshold = artifact['threshold']
-    prediction = 'Positive' if calibrated_prob >= threshold else 'Negative'
+    # D-ChSS score ও risk group artifact মেটাডাটা থেকে compute
+    dchss_score, _dchss_parts = compute_dchss_score(raw_input, artifact)
+    risk_group = assign_risk_group(dchss_score)
 
-    risk_group = assign_risk_group(row['DCHSS'], artifact['risk_thresholds'])
-
-    top_feature_explanations = explain_contributions(z_vector, artifact, top_n=8)
+    # Top feature explanations
+    explanations = build_top_feature_explanations(raw_input, artifact, top_n=8)
 
     return {
-        'probability_percent': probability_percent,
-        'prediction': prediction,
-        'risk_group': risk_group,
-        'dchss_score': round(row['DCHSS'], 4),
-        'threshold_used_percent': round(threshold * 100, 2),
-        'top_feature_explanations': top_feature_explanations,
-        'disclaimer': 'Research demonstration only - NOT a medical diagnosis tool.',
+        "probability_percent": probability_percent,
+        "prediction": prediction_label,
+        "risk_group": risk_group,
+        "dchss_score": dchss_score,
+        "threshold_used_percent": threshold_used_percent,
+        "top_feature_explanations": explanations,
+        "label": result["label"],
+        "disclaimer": "Research demonstration only - NOT a medical diagnosis tool.",
     }
