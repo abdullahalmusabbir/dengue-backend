@@ -1,40 +1,10 @@
-"""
-deocker_services.py
---------------------
-D-CHSS Dengue Detection মডেলের prediction service।
-
-এই সংস্করণটি 13.ipynb থেকে export করা-trained sklearn pipeline artifact
-(dengue_dchss_model.pkl) ব্যবহার করে। প্রি-প্রসেসিং (D-ChSS feature builder,
-imputation, scaling ও মডেল) সবই artifact এর ভেতরে ব accepted থাকে,
-যা make_prediction() (dchss_model.py) এর মাধ্যমে predict করে।
-
-Django শুধু artifact লোড করে, একটি CBC record পাঠায় এবং ফলাফল ফেরত পায়।
-dchss_score, risk_group এবং top_feature_explanations extraordinaire field গুলো
-artifact মেটাডাটা থেকে এখানে compute করা হয়, যাতে Django view / model schema
-এবং frontend API response কনট్రాక్టর একই থাকে (কোনো ব্রেকিং চেঞ্জ নেই)।
-
-সূচনা:
-1. compute_deviation() নোটবুকের transform()-এর সাথে একই লজিক maintains করে।
-   রেফারেন্স রেঞ্জের ভেতরে থাকলে deviation ০; বাইরে থাকলে বাউন্ডারি থেকে
-   সাইনড ডেভিয়েশন, এবং ±max_dev এ ক্যাপ করা হয়।
-2. rdw_platelet_ratio ফিচার এখন notebook এ থাকা ভাব অনুযায়ী
-   (rdw_cv / platelet × 1000) হিসাব করে predict_dengue()-এ যোগ করা হয়।
-3. risk_group হলো D-ChSS স্কোর (রক্তের CBC হিসাবের অস্বাভাবিকতার মাত্রা)
-   থেকে বের করা লেবেল, এটি ডেঙ্গু probability ভিত্তিক ঝুঁকির লেবেল নয়।
-"""
-
 import os
 import sys
 import pickle
 import threading
 from django.conf import settings
 
-# ---------------------------------------------------------------------------
-# Repo root ও ml_model ডিরেক্টরি কে import path এ যোগ করা, যাতে
-# dchss_model.py (dengues/ml_model এ থাকা) যে কোনো working directory থেকে
-# import করা যায়।
-# ---------------------------------------------------------------------------
-_PROJECT_ROOT = settings.BASE_DIR  # /app (repo root)
+_PROJECT_ROOT = settings.BASE_DIR
 _ML_MODEL_DIR = os.path.join(str(_PROJECT_ROOT), "dengues", "ml_model")
 if str(_ML_MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(_ML_MODEL_DIR))
@@ -43,13 +13,9 @@ from dchss_model import make_prediction  # noqa: E402
 
 
 class ModelNotLoadedError(Exception):
-    """Model artifact (pkl) খুঁজে না পেলে / load করতে সমস্যা হলে এই exception raise হবে"""
     pass
 
 
-# ---------------------------------------------------------------------------
-# ⭐ Model artifact path - এখানেই .pkl ফাইলটা রাখতে হবে
-# ---------------------------------------------------------------------------
 MODEL_PATH = os.path.join(str(_ML_MODEL_DIR), "dengue_dchss_model.pkl")
 
 EPS = 1e-6
@@ -58,11 +24,15 @@ _artifact = None
 _lock = threading.Lock()
 
 
+def _get_key(artifact, *names, default=None):
+    """Artifact থেকে możliwo কী-নেমের jouk প্রথম পাওয়া ভ্যালু রিটার্ন করে।"""
+    for name in names:
+        if name in artifact:
+            return artifact[name]
+    return default
+
+
 def load_artifact():
-    """
-    Singleton loader - pickle file একবারই load হয়ে memory তে cache থাকে।
-    Thread-safe (Gunicorn multi-worker এ সমস্যা হবে না)।
-    """
     global _artifact
     if _artifact is None:
         with _lock:
@@ -78,32 +48,33 @@ def load_artifact():
     return _artifact
 
 
-# ---------------------------------------------------------------------------
-# D-ChSS score ও risk group helpers (artifact মেটাডাটা থেকে compute)
-# dchss_model.DChSSFeatureBuilder এর "dchss_only" মোডের লজciens mirror করে।
-# ---------------------------------------------------------------------------
 def _get_interval(artifact, feature, gender):
-    """Gender-specific clinical reference range বের করা (না থাকলে default)"""
-    interval = artifact["reference_ranges"][feature]
+    reference_ranges = _get_key(
+        artifact,
+        "reference_ranges",
+        "reference_range",
+        "ranges",
+        default={},
+    )
+    interval = reference_ranges.get(feature)
+    if interval is None:
+        return None, None
     if isinstance(interval, dict):
         if gender == 1:
-            return interval["male"]
-        if gender == 0:
-            return interval["female"]
-        return interval["default"]
-    return interval  # tuple (low, high)
+            val = interval.get("male")
+        elif gender == 0:
+            val = interval.get("female")
+        else:
+            val = interval.get("default")
+        if isinstance(val, (list, tuple)) and len(val) == 2:
+            return val[0], val[1]
+        return None, None
+    if isinstance(interval, (list, tuple)) and len(interval) == 2:
+        return interval[0], interval[1]
+    return None, None
 
 
 def _compute_deviation(value, low, high, max_dev):
-    """
-    Reference range এর বাউন্ডারি থেকে signed deviation বের করা এবং max_dev এ cap করা।
-    dchss_model.py এর transform()-এর সাথে একই সংজ্ঞা।
-    
-    ম Tobago:
-    - value < low:  (value - low) / low
-    - value > high: (value - high) / high
-    - otherwise:    0.0
-    """
     if value is None or low is None or high is None:
         return 0.0
     if value < low:
@@ -116,16 +87,49 @@ def _compute_deviation(value, low, high, max_dev):
 
 
 def compute_dchss_score(raw_input, artifact):
-    """
-    D-ChSS score বের করা artifact এর reference_ranges, dchss_weights এবং
-    ts/ls/hs features ব্যবহার করে। (TS, LS, HS উপাদানও রিটার্ন করে)
-    """
-    reference_ranges = artifact["reference_ranges"]
-    weights = artifact["dchss_weights"]  # {'TS':.., 'LS':.., 'HS':..}
-    cbc_features = artifact["cbc_features"]
-    ts_features = artifact["ts_features"]
-    ls_features = artifact["ls_features"]
-    hs_features = artifact["hs_features"]
+    reference_ranges = _get_key(
+        artifact,
+        "reference_ranges",
+        "reference_range",
+        "ranges",
+        default={},
+    )
+    weights = _get_key(
+        artifact,
+        "dchss_weights",
+        "dchss_weight",
+        "weights",
+        "dchss",
+        default={"TS": 1.0, "LS": 1.0, "HS": 1.0},
+    )
+    cbc_features = _get_key(
+        artifact,
+        "cbc_features",
+        "cbc_feature_names",
+        "features",
+        default=[],
+    )
+    ts_features = _get_key(
+        artifact,
+        "ts_features",
+        "ts_feature_names",
+        "ts",
+        default=[],
+    )
+    ls_features = _get_key(
+        artifact,
+        "ls_features",
+        "ls_feature_names",
+        "ls",
+        default=[],
+    )
+    hs_features = _get_key(
+        artifact,
+        "hs_features",
+        "hs_feature_names",
+        "hs",
+        default=[],
+    )
 
     gender = str(raw_input.get("gender", "other")).strip().lower()
     if gender in {"male", "m", "man", "1"}:
@@ -156,19 +160,15 @@ def compute_dchss_score(raw_input, artifact):
     ls = mean_dev(ls_features)
     hs = mean_dev(hs_features)
 
-    dchss = weights["TS"] * ts + weights["LS"] * ls + weights["HS"] * hs
+    dchss = (
+        weights.get("TS", 1.0) * ts
+        + weights.get("LS", 1.0) * ls
+        + weights.get("HS", 1.0) * hs
+    )
     return round(dchss, 4), {"TS": ts, "LS": ls, "HS": hs, "signed": signed}
 
 
 def assign_risk_group(dchss_score, risk_thresholds=None):
-    """
-    D-ChSS score কে Low / Moderate / High এ ভাগ করা।
-    
-    দ্রষ্টব্য: এই লেবেলটি ডেঙ্গু probability ভিত্তিক ঝুঁকির লেবেল নয়। 
-    এটি শুধু D-ChSS স্কোর থেকে বের করা হয়, যা রক্তের CBC হিসাবের 
-    অস্বাভাবিকতার মাত্রা (deviation) প্রকাশ করে। ডেঙ্গু ঝুঁকি বোঝার জন্য
-    probability_percent (predict_dengue()-এর রিটার্ন করা মান) ব্যবহার করুন।
-    """
     if risk_thresholds is None:
         risk_thresholds = (0.25, 0.50)
     low_thresh, high_thresh = risk_thresholds
@@ -181,16 +181,20 @@ def assign_risk_group(dchss_score, risk_thresholds=None):
 
 
 def build_top_feature_explanations(raw_input, artifact, top_n=8):
-    """
-    প্রতিটি CBC feature এর deviation magnitude অনুযায়ী top_N ফিচার কে
-    explanation হিসেবে রিটার্ন করা (SHAP এর বদলে lightweight approximation)।
-    effect মানে 'dengue risk বাড়াচ্ছে' বা 'dengue risk কমাচ্ছে'।
-    
-    দ্রষ্টব্য: deviation মagni tude শুধু রেফারেন্স রেঞ্জের বাইরে থাকার পরিমাপ,
-    ডেঙ্গু probability এ সরাসরি অবদান নয়।
-    """
-    reference_ranges = artifact["reference_ranges"]
-    cbc_features = artifact["cbc_features"]
+    reference_ranges = _get_key(
+        artifact,
+        "reference_ranges",
+        "reference_range",
+        "ranges",
+        default={},
+    )
+    cbc_features = _get_key(
+        artifact,
+        "cbc_features",
+        "cbc_feature_names",
+        "features",
+        default=[],
+    )
 
     gender = str(raw_input.get("gender", "other")).strip().lower()
     if gender in {"male", "m", "man", "1"}:
@@ -225,26 +229,10 @@ def build_top_feature_explanations(raw_input, artifact, top_n=8):
     return explanations
 
 
-# ---------------------------------------------------------------------------
-# ⭐ Public API - Django view থেকে এই ফাংশনটাই call হবে
-# ---------------------------------------------------------------------------
 def predict_dengue(raw_input: dict) -> dict:
-    """
-    raw_input: {
-        'gender': 'male'|'female'|'other', 'age': float,
-        'hemoglobin':.., 'neutrophils':.., 'lymphocytes':.., 'monocytes':..,
-        'eosinophils':.., 'rbc':.., 'hct':.., 'mcv':.., 'mch':.., 'mchc':..,
-        'rdw_cv':.., 'platelet':.., 'mpv':.., 'pdw':.., 'pct':.., 'wbc':..
-    }
-
-    রিটার্ন ডিকশনারি keys গুলো views.py ও frontend (DenguePredictionResult)-এর
-    সাথে একই রাখা হয়েছে, তাই কোনো ব্রেকিং চেঞ্জ নেই।
-    """
     raw_input = dict(raw_input)
     raw_input["gender"] = str(raw_input.get("gender", "other")).lower()
 
-    # ⭐ rdw_platelet_ratio ফিচার যোগ করা (13.ipynb নোটবুকের সাথে মেলানোর জন্য)
-    # Notebook এ: rdw_platelet_ratio = RDW-CV ÷ platelet × 1000
     try:
         rdw_cv_val = float(raw_input.get("rdw_cv", 0) or 0)
         platelet_val = float(raw_input.get("platelet", 0) or 0)
@@ -257,7 +245,6 @@ def predict_dengue(raw_input: dict) -> dict:
 
     artifact = load_artifact()
 
-    # Core probability / prediction trained sklearn pipeline- এর মাধ্যমে
     result = make_prediction(artifact, raw_input)
 
     probability = float(result["probability"])
@@ -268,11 +255,9 @@ def predict_dengue(raw_input: dict) -> dict:
     probability_percent = round(probability * 100, 2)
     threshold_used_percent = round(threshold * 100, 2)
 
-    # D-ChSS score ও risk group artifact মেটাডাটা থেকে compute
     dchss_score, _dchss_parts = compute_dchss_score(raw_input, artifact)
     risk_group = assign_risk_group(dchss_score)
 
-    # Top feature explanations
     explanations = build_top_feature_explanations(raw_input, artifact, top_n=8)
 
     return {

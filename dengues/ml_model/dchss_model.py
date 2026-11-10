@@ -3,9 +3,8 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 
-class DCHSSFeatureBuilder(BaseEstimator, TransformerMixin):
-    """Build raw, D-CHSS, signed or directional CBC features."""
 
+class DCHSSFeatureBuilder(BaseEstimator, TransformerMixin):
     def __init__(
         self, mode="raw", raw_features=None, numeric_features=None,
         cbc_features=None, reference_ranges=None, ts_features=None,
@@ -33,22 +32,35 @@ class DCHSSFeatureBuilder(BaseEstimator, TransformerMixin):
         return self
 
     def _get_interval(self, feature, gender):
-        interval = self.reference_ranges[feature]
+        if not self.reference_ranges:
+            return None, None
+        interval = self.reference_ranges.get(feature)
+        if interval is None:
+            return None, None
         if isinstance(interval, dict):
             if gender == 1:
-                return interval["male"]
-            if gender == 0:
-                return interval["female"]
-            return interval["default"]
-        return interval
+                val = interval.get("male")
+            elif gender == 0:
+                val = interval.get("female")
+            else:
+                val = interval.get("default")
+            if isinstance(val, (list, tuple)) and len(val) == 2:
+                return val[0], val[1]
+            return None, None
+        if isinstance(interval, (list, tuple)) and len(interval) == 2:
+            return interval[0], interval[1]
+        return None, None
 
     def transform(self, X):
         frame = pd.DataFrame(X, columns=self.raw_features).copy()
 
-        for column in self.numeric_features:
+        for column in (self.numeric_features or []):
+            median_val = 0.0
+            if hasattr(self, "medians_") and column in self.medians_:
+                median_val = self.medians_[column]
             frame[column] = (
                 pd.to_numeric(frame[column], errors="coerce")
-                .fillna(self.medians_[column])
+                .fillna(median_val)
             )
 
         frame["gender_enc"] = (
@@ -56,7 +68,7 @@ class DCHSSFeatureBuilder(BaseEstimator, TransformerMixin):
         )
 
         signed = pd.DataFrame(index=frame.index)
-        for feature in self.cbc_features:
+        for feature in (self.cbc_features or []):
             deviations = []
             for value, gender in zip(
                 frame[feature].to_numpy(),
@@ -81,33 +93,56 @@ class DCHSSFeatureBuilder(BaseEstimator, TransformerMixin):
             signed[f"{feature}_dev"] = deviations
 
         directional = pd.DataFrame(index=frame.index)
-        for feature in self.cbc_features:
+        for feature in (self.cbc_features or []):
             deviation = signed[f"{feature}_dev"]
             directional[f"{feature}_low_dev"] = np.maximum(-deviation, 0)
             directional[f"{feature}_high_dev"] = np.maximum(deviation, 0)
 
         absolute = signed.abs()
-        frame["TS"] = absolute[
-            [f"{feature}_dev" for feature in self.ts_features]
-        ].mean(axis=1)
-        frame["LS"] = absolute[
-            [f"{feature}_dev" for feature in self.ls_features]
-        ].mean(axis=1)
-        frame["HS"] = absolute[
-            [f"{feature}_dev" for feature in self.hs_features]
-        ].mean(axis=1)
-        frame["DCHSS"] = sum(
-            self.weights[name] * frame[name] for name in self.weights
-        )
+
+        if self.ts_features:
+            frame["TS"] = absolute[
+                [f"{feature}_dev" for feature in self.ts_features]
+            ].mean(axis=1)
+        else:
+            frame["TS"] = 0.0
+
+        if self.ls_features:
+            frame["LS"] = absolute[
+                [f"{feature}_dev" for feature in self.ls_features]
+            ].mean(axis=1)
+        else:
+            frame["LS"] = 0.0
+
+        if self.hs_features:
+            frame["HS"] = absolute[
+                [f"{feature}_dev" for feature in self.hs_features]
+            ].mean(axis=1)
+        else:
+            frame["HS"] = 0.0
+
+        if self.weights:
+            dchss_parts = []
+            for name, w in self.weights.items():
+                if name in frame.columns:
+                    dchss_parts.append(w * frame[name])
+            if dchss_parts:
+                frame["DCHSS"] = sum(dchss_parts)
+            else:
+                frame["DCHSS"] = 0.0
+        else:
+            frame["DCHSS"] = 0.0
 
         if self.mode == "raw":
-            result = frame[self.raw_features]
+            result = frame[self.raw_features] if self.raw_features else frame
         elif self.mode == "dchss_only":
             result = frame[["TS", "LS", "HS", "DCHSS"]]
         elif self.mode == "combined_signed":
-            result = pd.concat([frame[self.raw_features], signed], axis=1)
+            base = frame[self.raw_features] if self.raw_features else frame
+            result = pd.concat([base, signed], axis=1)
         elif self.mode == "combined_directional":
-            result = pd.concat([frame[self.raw_features], directional], axis=1)
+            base = frame[self.raw_features] if self.raw_features else frame
+            result = pd.concat([base, directional], axis=1)
         else:
             raise ValueError(f"Unknown feature mode: {self.mode}")
 
@@ -118,14 +153,21 @@ class DCHSSFeatureBuilder(BaseEstimator, TransformerMixin):
         return self.feature_names_out_
 
 
-def make_prediction(model_artifact, payload):
-    """
-    Accept one CBC record as a dictionary and return a prediction.
+def _get_key(artifact, *names, default=None):
+    for name in names:
+        if name in artifact:
+            return artifact[name]
+    return default
 
-    Expected keys are the canonical feature names stored in artifact['raw_features'].
-    Use 'gender' or 'sex' as Male/Female or 1/0; gender_enc is derived here.
-    """
-    raw_features = model_artifact["raw_features"]
+
+def make_prediction(model_artifact, payload):
+    raw_features = _get_key(
+        model_artifact,
+        "raw_features",
+        "features",
+        "feature_names",
+        default=[],
+    )
     aliases = {
         "sex": "gender", "haemoglobin": "hemoglobin", "hb": "hemoglobin",
         "mcv(fl)": "mcv", "mch(pg)": "mch", "mpv(fl)": "mpv",
@@ -155,14 +197,32 @@ def make_prediction(model_artifact, payload):
         else:
             row[feature] = cleaned.get(feature, np.nan)
 
-    input_frame = pd.DataFrame([row], columns=raw_features)
-    probability = float(model_artifact["pipeline"].predict_proba(input_frame)[0, 1])
-    threshold = float(model_artifact["decision_threshold"])
-    prediction = int(probability >= threshold)
+    cols = raw_features if raw_features else list(row.keys())
+    input_frame = pd.DataFrame([row], columns=cols)
+
+    pipeline = _get_key(
+        model_artifact,
+        "pipeline",
+        "model",
+        "sklearn_pipeline",
+        default=None,
+    )
+    threshold = _get_key(
+        model_artifact,
+        "decision_threshold",
+        "threshold",
+        default=0.5,
+    )
+
+    if pipeline is None:
+        raise ValueError("Model artifact-এ 'pipeline' key পাওয়া যায়নি।")
+
+    probability = float(pipeline.predict_proba(input_frame)[0, 1])
+    prediction = int(probability >= float(threshold))
 
     return {
         "prediction": prediction,
         "label": "Dengue positive" if prediction == 1 else "Dengue negative",
         "probability": probability,
-        "threshold": threshold
+        "threshold": float(threshold)
     }
