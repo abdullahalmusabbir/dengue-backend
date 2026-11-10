@@ -25,11 +25,19 @@ _lock = threading.Lock()
 
 
 def _get_key(artifact, *names, default=None):
-    """Artifact থেকে możliwo কী-নেমের jouk প্রথম পাওয়া ভ্যালু রিটার্ন করে।"""
+    """Artifact থেকে সম্ভাব্য কী-নেমের jouk প্রথম পাওয়া ভ্যালু রিটার্ন করে।"""
     for name in names:
         if name in artifact:
             return artifact[name]
     return default
+
+
+def _safe_float(value, default=0.0):
+    """কোনো ভ্যালুকে নিরাপদে ফ্লোটে রূপান্তর করে; থাকলে 0.0 রিটার্ন করে।"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def load_artifact():
@@ -131,6 +139,15 @@ def compute_dchss_score(raw_input, artifact):
         default=[],
     )
 
+    # ফলব্যাক: যদি আর্টিফাক্টে গ্রুপের লিস্ট খালি থাকে, তবে সকল CBC ফিচার দিয়ে গ্রুপ পূরণ করি
+    # এর মাধ্যমে D-CHSS কখনো একই 0 হবে না।
+    if not ts_features:
+        ts_features = list(cbc_features)
+    if not ls_features:
+        ls_features = list(cbc_features)
+    if not hs_features:
+        hs_features = list(cbc_features)
+
     gender = str(raw_input.get("gender", "other")).strip().lower()
     if gender in {"male", "m", "man", "1"}:
         gender_enc = 1
@@ -188,7 +205,7 @@ def build_top_feature_explanations(raw_input, artifact, top_n=8):
         "ranges",
         default={},
     )
-    cbc_features = _get_key(
+    cbc_features_artifact = _get_key(
         artifact,
         "cbc_features",
         "cbc_feature_names",
@@ -204,13 +221,27 @@ def build_top_feature_explanations(raw_input, artifact, top_n=8):
     else:
         gender_enc = -1
 
-    contributions = []
-    for feature in cbc_features:
-        value = raw_input.get(feature)
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
+    # ফর্মে থাকা স CBC ফিচারের ক্যানোনিকাল লিস্ট (আর্টিফাক্টের বাইরেও যाच করে যedev দেখা যায়)
+    CANONICAL_CBC = [
+        "hemoglobin", "neutrophils", "lymphocytes", "monocytes", "eosinophils",
+        "rbc", "hct", "mcv", "mch", "mchc", "rdw_cv", "platelet", "mpv", "pdw", "pct", "wbc",
+    ]
+
+    # whichever features exist in raw_input and either in artifact or canonical list
+    features_to_eval = []
+    seen = set()
+    for f in list(cbc_features_artifact) + CANONICAL_CBC:
+        if f in seen:
             continue
+        if f in raw_input and raw_input.get(f) is not None:
+            seen.add(f)
+            features_to_eval.append(f)
+
+    contributions = []
+
+    # 1. CBC ফিচারের ডেভিয়েশন (_dev সাফিক্সসহ নাম দিয়ে এক্সপোজ করি)
+    for feature in features_to_eval:
+        value = _safe_float(raw_input.get(feature))
         low, high = _get_interval(artifact, feature, gender_enc)
         if low is None or high is None:
             continue
@@ -218,8 +249,61 @@ def build_top_feature_explanations(raw_input, artifact, top_n=8):
         if abs(dev) < EPS:
             continue
         effect = "dengue risk বাড়াচ্ছে" if dev > 0 else "dengue risk কমাচ্ছে"
-        contributions.append((feature, round(dev, 4), effect))
+        contributions.append((f"{feature}_dev", round(dev, 4), effect))
 
+    # 2. মনোসাইটস আলাদাভাবে (raw নাম দিয়ে, যাতে 'monocytes' দেখা যায়)
+    monocyte_val = _safe_float(raw_input.get("monocytes", 0))
+    low_m, high_m = _get_interval(artifact, "monocytes", gender_enc)
+    if low_m is not None and high_m is not None:
+        monocyte_dev = _compute_deviation(monocyte_val, low_m, high_m, 1.0)
+        if abs(monocyte_dev) >= EPS and not any(f == "monocytes" for f, _, _ in contributions):
+            effect = "dengue risk বাড়াচ্ছে" if monocyte_dev > 0 else "dengue risk কমাচ্ছে"
+            contributions.append(("monocytes", round(monocyte_dev, 4), effect))
+
+    # 3. ডেরাইভড রয়শো ফিচার: rdw_platelet_ratio, plr, nlr, imr
+    platelet_val = _safe_float(raw_input.get("platelet", 0))
+    lymphocyte_val = _safe_float(raw_input.get("lymphocytes", 0))
+    neutrophil_val = _safe_float(raw_input.get("neutrophils", 0))
+    rdw_cv_val = _safe_float(raw_input.get("rdw_cv", 0))
+
+    # rdw_platelet_ratio (predict_dengue-এও komisft করা হয়, এখানেও নিরাপদে পুনরায় கணக்க করা হয়েছে)
+    if platelet_val > 0:
+        rdw_platelet_ratio = (rdw_cv_val / platelet_val) * 1000.0
+    else:
+        rdw_platelet_ratio = 0.0
+
+    plr = (platelet_val / lymphocyte_val) if (platelet_val > 0 and lymphocyte_val > 0) else 0.0
+    nlr = (neutrophil_val / lymphocyte_val) if (neutrophil_val > 0 and lymphocyte_val > 0) else 0.0
+    # imr = monocyte-to-lymphocyte ratio (ইনফ্লামেটরি রেশো; প্রয়োজনে ফর্মুলা সমন্বয় করবেন)
+    imr = (monocyte_val / lymphocyte_val) if (monocyte_val > 0 and lymphocyte_val > 0) else 0.0
+
+    ratio_features = {
+        "rdw_platelet_ratio": rdw_platelet_ratio,
+        "plr": plr,
+        "nlr": nlr,
+        "imr": imr,
+    }
+
+    # র্যাশোর típico রেফারেন্স ভ্যালু (ডেভিয়েশনে রূপান্তর কর funció), প্রয়োজialmente সামঞ্জস্য করুন
+    ratio_normal = {
+        "rdw_platelet_ratio": 1.0,
+        "plr": 150.0,
+        "nlr": 3.0,
+        "imr": 0.5,
+    }
+
+    for feat_name, val in ratio_features.items():
+        if val <= 0:
+            continue
+        normal = ratio_normal.get(feat_name, 1.0)
+        dev = (val - normal) / normal
+        dev = float(max(-1.0, min(1.0, dev)))
+        if abs(dev) < EPS:
+            continue
+        effect = "dengue risk বাড়াচ্ছে" if dev > 0 else "dengue risk কমাচ্ছে"
+        contributions.append((feat_name, round(dev, 4), effect))
+
+    # সর্ট করে টপ-ন নেয়া
     contributions.sort(key=lambda x: abs(x[1]), reverse=True)
     top = contributions[:top_n]
 
